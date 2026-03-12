@@ -16,11 +16,11 @@ import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
+import android.graphics.Bitmap
 import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.support.image.TensorImage
-import org.tensorflow.lite.support.image.ops.ResizeOp
-import org.tensorflow.lite.support.image.ImageProcessor
 import java.io.FileInputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 import java.util.concurrent.ExecutorService
@@ -41,8 +41,9 @@ class DrowsinessActivity : AppCompatActivity() {
          */
         private const val MODEL_NAME       = "drowsiness_model.tflite"
         private const val INPUT_SIZE       = 224
-        private const val DROWSY_THRESHOLD = 0.6f
-        private const val ALERT_FRAMES     = 5
+        private const val DROWSY_THRESHOLD = 0.5f   // above 50% = drowsy
+        private const val ALERT_FRAMES     = 2       // out of rolling window below
+        private const val WINDOW_SIZE      = 4       // rolling window size
     }
 
     private lateinit var previewView    : PreviewView
@@ -56,7 +57,8 @@ class DrowsinessActivity : AppCompatActivity() {
     private var imageAnalysis           : ImageAnalysis? = null
     private var tflite                  : Interpreter? = null
     private var isDetecting             = false
-    private var drowsyFrameCount        = 0
+    private var isAlertActive           = false   // tracks drowsy alert state
+    private val predictionWindow        = ArrayDeque<Boolean>(WINDOW_SIZE) // rolling window
     private var modelLoaded             = false
     private var toneGenerator           : ToneGenerator? = null
 
@@ -206,48 +208,93 @@ class DrowsinessActivity : AppCompatActivity() {
             } catch (e: Exception) { Log.e(TAG, "Rebind failed: ${e.message}") }
         }
         isDetecting      = false
-        drowsyFrameCount = 0
+        isAlertActive    = false
         btnStart.text    = getString(R.string.start_detection)
         tvStatus.text    = "Detection stopped — camera preview active"
         tvAlert.visibility   = View.GONE
         tvConfidence.text    = "Confidence: --"
+        predictionWindow.clear()
     }
 
     // ── Inference ────────────────────────────────────────────────────────────
     private fun runInference(imageProxy: ImageProxy) {
         val tfl = tflite ?: run { imageProxy.close(); return }
         try {
-            val bitmap = imageProxy.toBitmap()
+            val raw = imageProxy.toBitmap()
             imageProxy.close()
 
-            val processor = ImageProcessor.Builder()
-                .add(ResizeOp(INPUT_SIZE, INPUT_SIZE, ResizeOp.ResizeMethod.BILINEAR))
-                .build()
-            val tensorImage = processor.process(TensorImage.fromBitmap(bitmap))
+            // Scale to model input size
+            val bitmap = Bitmap.createScaledBitmap(raw, INPUT_SIZE, INPUT_SIZE, true)
 
-            // Adjust output shape to match your model: [1,2] two-class or [1,1] single
-            val output = Array(1) { FloatArray(2) }
-            tfl.run(tensorImage.buffer, output)
+            // Build float32 ByteBuffer: [1, H, W, 3] normalized to [0, 1]
+            val inputBuffer = ByteBuffer.allocateDirect(1 * INPUT_SIZE * INPUT_SIZE * 3 * 4)
+            inputBuffer.order(ByteOrder.nativeOrder())
+            inputBuffer.rewind()  // ← CRITICAL: must be at position 0 before filling
+            val pixels = IntArray(INPUT_SIZE * INPUT_SIZE)
+            bitmap.getPixels(pixels, 0, INPUT_SIZE, 0, 0, INPUT_SIZE, INPUT_SIZE)
+            for (pixel in pixels) {
+                inputBuffer.putFloat(((pixel shr 16) and 0xFF) / 127.5f - 1.0f) // R → [-1, 1]
+                inputBuffer.putFloat(((pixel shr 8)  and 0xFF) / 127.5f - 1.0f) // G → [-1, 1]
+                inputBuffer.putFloat((pixel           and 0xFF) / 127.5f - 1.0f) // B → [-1, 1]
+            }
+            inputBuffer.rewind()  // ← CRITICAL: reset to 0 before passing to TFLite
 
-            val drowsyScore = output[0][1]   // index [1] = drowsy class
-            if (drowsyScore >= DROWSY_THRESHOLD) drowsyFrameCount++ else drowsyFrameCount = 0
+            // Detect output shape at runtime
+            val outputShape = tfl.getOutputTensor(0).shape()
+            val numClasses = if (outputShape.size >= 2) outputShape[outputShape.size - 1] else 1
 
-            runOnUiThread { updateUI(drowsyScore, drowsyFrameCount >= ALERT_FRAMES) }
+            val score0: Float
+            val score1: Float
+            if (numClasses >= 2) {
+                val output = Array(1) { FloatArray(numClasses) }
+                tfl.run(inputBuffer, output)
+                score0 = output[0][0]
+                score1 = output[0][1]
+            } else {
+                val output = Array(1) { FloatArray(1) }
+                tfl.run(inputBuffer, output)
+                score0 = output[0][0]
+                score1 = output[0][0]
+            }
+
+            // Log both classes so we can tell which index is drowsy
+            Log.d(TAG, "scores → [0]=${"%05.3f".format(score0)}  [1]=${"%05.3f".format(score1)}")
+
+            // Model class order: [Drowsy=0, Non Drowsy=1]
+            val drowsyScore = score0
+            val awakeScore  = 1f - drowsyScore  // always sums to 100%
+
+            // Rolling window majority vote
+            if (predictionWindow.size >= WINDOW_SIZE) predictionWindow.removeFirst()
+            predictionWindow.addLast(drowsyScore >= DROWSY_THRESHOLD)
+            val drowsyVotes = 20*predictionWindow.count { it }
+            val alert = drowsyVotes >= ALERT_FRAMES
+
+            runOnUiThread { updateUI(drowsyScore, awakeScore, alert) }
         } catch (e: Exception) {
             Log.e(TAG, "Inference error: ${e.message}")
             imageProxy.close()
         }
     }
 
-    private fun updateUI(score: Float, alert: Boolean) {
-        tvConfidence.text = "Drowsy confidence: ${"%.1f".format(score * 100)}%"
-        if (alert) {
+    private fun updateUI(drowsyScore: Float, awakeScore: Float, alert: Boolean) {
+        val drowsyPct = (drowsyScore * 100).toInt()
+        val awakePct  = (awakeScore  * 100).toInt()
+        tvConfidence.text = "Drowsy: $drowsyPct%  |  Awake: $awakePct%"
+
+        if (alert && !isAlertActive) {
+            // Transition: awake → drowsy — fire alert once
+            isAlertActive = true
             tvStatus.text      = "😴 DROWSY"
             tvAlert.visibility = View.VISIBLE
-            toneGenerator?.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 500)
-        } else {
+            toneGenerator?.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 1500)
+        } else if (!alert && isAlertActive) {
+            // Transition: drowsy → awake — clear alert
+            isAlertActive = false
             tvStatus.text      = "✅ AWAKE"
             tvAlert.visibility = View.GONE
+        } else if (!alert) {
+            tvStatus.text      = "✅ AWAKE"
         }
     }
 
