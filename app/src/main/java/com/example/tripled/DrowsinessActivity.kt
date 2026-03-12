@@ -267,7 +267,7 @@ class DrowsinessActivity : AppCompatActivity() {
             // Rolling window majority vote
             if (predictionWindow.size >= WINDOW_SIZE) predictionWindow.removeFirst()
             predictionWindow.addLast(drowsyScore >= DROWSY_THRESHOLD)
-            val drowsyVotes = 20*predictionWindow.count { it }
+            val drowsyVotes = 5*predictionWindow.count { it }
             val alert = drowsyVotes >= ALERT_FRAMES
 
             runOnUiThread { updateUI(drowsyScore, awakeScore, alert) }
